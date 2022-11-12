@@ -14,6 +14,8 @@ python update_configs.py --model=${model_name} --n_word=${n_words} --block_size=
 
 Noted that we implement evaluation on ImageNet with [**lmdb**](http://www.lmdb.tech/doc/), the code of [get_imagenet.py](utils/get_imagenet.py) should be modified to fit your environment.
 
+## Further Improvement
+
 This conference paper is invited for [*Knowledge and Information Systems (KAIS)*](https://www.springer.com/journal/10115) publication as *Best-ranked* paper. New features in KAIS verison are listed as following:
 
 - Shared dictionary design
