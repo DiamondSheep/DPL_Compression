@@ -9,7 +9,7 @@ sh run_DPL_Compress.sh
 
 ## How to modify configs for specific model
 ```
-python update_configs.py --n_word=${n_words} --block_size=${block_size}
+python update_configs.py --model=${model_name} --n_word=${n_words} --block_size=${block_size}
 ```
 
 Noted that we implement evaluation on ImageNet with [**lmdb**](http://www.lmdb.tech/doc/), the code of [get_imagenet.py](utils/get_imagenet.py) should be modified to fit your environment.
