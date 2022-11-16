@@ -1,4 +1,4 @@
-# This is the official repository for IEEE ICDM 2021 paper: ***Dictionary Pair-based Data-Free Fast Deep Neural Network Compression***
+# This is the official repository for IEEE ICDM 2021 paper: **Dictionary Pair-based Data-Free Fast Deep Neural Network Compression**
 
 ![Main Process](img_README/process.png)
 
