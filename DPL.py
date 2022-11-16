@@ -1,7 +1,4 @@
-import time
 import torch
-from utils.reshape import reshape_weight, reshape_back_weight
-
 
 class DPL():
     def __init__(self, Data, DictSize=30, tau=0.05, gamma=0.0001):
@@ -95,36 +92,6 @@ class DPL():
     def evaluate(self):
         err = torch.norm(torch.matmul(self.DictMat, torch.matmul(self.P_Mat, self.DataMat)) - self.DataMat)
         return err
-
-class DPL_compress():
-    def __init__(self, weight, n_blocks, n_word, iterations, k, tau):
-        self.n_blocks = n_blocks
-        self.n_word = n_word
-        self.iterations = iterations
-        self.compress_time = 0.0
-        self.size_layer = 0.0
-        self.tau = tau
-        self.k = k
-        #reshape and chunk weight matrix
-        self.M = reshape_weight(weight)
-        assert self.M.size(0) % self.n_blocks == 0
-        self.M_blocks = self.M.chunk(n_blocks, dim=0)
-        self.dpl_blocks = []
-
-    def quantize(self, is_conv):
-        t = time.time()
-        for M_block in self.M_blocks:
-            dpl = DPL(Data=M_block, DictSize=self.n_word, tau=self.tau)
-            dpl.Update(iterations=self.iterations, showFlag=False)
-            self.dpl_blocks.append(torch.matmul(dpl.DictMat, torch.matmul(dpl.P_Mat, dpl.DataMat)))
-            block_size = self.n_word * (M_block.shape[1] + M_block.shape[0]) * 2/1024/1024
-            self.size_layer += block_size
-
-        self.compress_time += time.time() - t
-        self.M = torch.cat(self.dpl_blocks, dim=0)
-        self.M = reshape_back_weight(self.M, k=self.k, conv=is_conv)
-        return self.M
-
 
 if __name__ == "__main__":
     pass

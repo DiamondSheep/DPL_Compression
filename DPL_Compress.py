@@ -1,5 +1,6 @@
-import time
 import os
+import csv
+import time
 import argparse
 import logging
 import logging.config
@@ -8,13 +9,12 @@ import torch.backends.cudnn as cudnn
 
 from operator import attrgetter
 from configparser import ConfigParser
+from pytorchcv.model_provider import get_model
 
-from utils.watcher import ActivationWatcher
-from utils.reshape import reshape_weight, reshape_back_weight
-from utils.utils import compute_size
+from utils.utils import ActivationWatcher, compute_size, reshape_weight, reshape_back_weight
 from utils import dataloader
-from train_and_eval import evaluate
-import model
+from utils.eval import evaluate
+
 import DPL
 
 def loggerWarpper(logger, func, *argv):
@@ -36,7 +36,7 @@ parser.add_argument('--model_path', default=None, type=str,
                     help='.pth file path to load pretrained model')
 parser.add_argument('--n-workers', default=4, type=int,
                     help='Number of workers for data loading')
-parser.add_argument('--batch-size', default=256, type=int,
+parser.add_argument('--batch-size', default=128, type=int,
                     help='Batch size for val data loading')
 parser.add_argument('--distributed', default=False, type=bool,
                     help='For multiprocessing distributed')
@@ -55,6 +55,16 @@ parser.add_argument('--pretest', default=False, action='store_true',
                     help='Evaluate model before compression')
 parser.add_argument('--dbg', default=False, action='store_true',
                     help='Show processing information')
+parser.add_argument('--shared', default=False, action='store_true',
+                    help='For shared dictionary')
+parser.add_argument('--auto_param', default=False, action='store_true',
+                    help='auto parameter tuning')
+parser.add_argument('--error_thres_up', default=0.000006, type=float, 
+                    help='lower up threshold decrease the construction error')
+parser.add_argument('--error_thres_down', default=None, type=float, 
+                    help='higher down threshold lead to larger compression ratio')
+parser.add_argument('--results', default='results/', type=str,
+                    help='path to results')
 
 args = parser.parse_args()
 logging.config.fileConfig(os.path.join(args.config, 'logger.config'))
@@ -63,15 +73,20 @@ if args.dbg:
     logger.setLevel(logging.DEBUG)
 else: 
     logger.setLevel(logging.INFO)
-logger.info(f"DPL Compression")
+logger.info(f"DPL Compression Starting.")
 
 if __name__ == '__main__':
-    # config for bloks and words
+    # config for blocks and words
     logger.info(f"block and word config loading.")
     blockconfig = ConfigParser()
     wordconfig = ConfigParser()
-    blockconfig.read(os.path.join(args.config, 'DPL_block.config'), encoding='UTF-8')
-    wordconfig.read(os.path.join(args.config, 'DPL_word.config'), encoding='UTF-8')
+    block_config_file = os.path.join(args.config, 'DPL_block_cv.config')
+    word_config_file = os.path.join(args.config, 'DPL_word_cv.config')
+    blockconfig.read(block_config_file, encoding='UTF-8')
+    wordconfig.read(word_config_file, encoding='UTF-8')
+    if args.error_thres_down == None:
+        # auto config the down thres
+        args.error_thres_down = args.error_thres_up / 10
     logger.info(f"Configuration: {args}")
     
     # ---- load dataset ----
@@ -79,9 +94,8 @@ if __name__ == '__main__':
     logger.info(f"Dataset loaded.")
     
     # ---- load pretrained model ---- 
-    model = model.__dict__[args.model](pretrained=(args.dataset == 'imagenet'), num_classes=num_classes)
-    if args.model_path: #load private pretrained model 
-        model.load_state_dict(torch.load(args.model_path))
+    args.model = f'{args.model}_{args.dataset}' if 'cifar' in args.dataset else args.model
+    model = get_model(args.model, pretrained=True)
     model.eval()
     #device
     if torch.cuda.is_available():
@@ -105,15 +119,38 @@ if __name__ == '__main__':
     watcher = ActivationWatcher(model)
     layers = [layer for layer in watcher.layers[layer_start: ]]
     #-------------------------------  DPL Compression   ------------------------------    
-    logger.info(f'DPL Compression\n')
+    logger.info(f'Compressing')
+    last_layer = None
     for layer in layers:
-        #get weight of layer
-        M = attrgetter(layer + '.weight.data')(model).detach()
-        size_uncompressed_layer = M.numel() * 4 / 1024 / 1024
-        size_other -= size_uncompressed_layer
-        logger.debug(f'{layer} - {list(M.size())} - {size_uncompressed_layer:.5f}MB - blocksize: {blockconfig[args.model][layer]} - wordsize: {wordconfig[args.model][layer]}')
+        M = None
+        M_last = None
+        shared = False
+        if args.shared and 'conv' in layer and (int(wordconfig[args.model + '_shared'][layer]) == 0 or last_layer is not None):
+            shared = True
+            #shared dictionary design for [conv1, conv2]
+            if int(wordconfig[args.model + '_shared'][layer]) == 0:
+                logger.debug(f'shared dictionary activated')
+                last_layer = layer
+                continue
+            else:
+                M_last = attrgetter(last_layer + '.weight.data')(model).detach()
+                M = attrgetter(layer + '.weight.data')(model).detach()
+                size_uncompressed_layer = (M.numel() + M_last.numel()) * 4 / 1024 / 1024 
+                size_other -= size_uncompressed_layer
+                block_size = int(blockconfig[args.model + '_shared'][layer])
+                n_word = int(wordconfig[args.model + '_shared'][layer])
+                logger.debug(f'{last_layer}+{layer} - {list(M_last.size())}+{list(M.size())} - {size_uncompressed_layer:.5f}MB - blocksize {block_size} - words {n_word}')
 
-        #load compressed model
+        else:
+            #get weight of layer
+            M = attrgetter(layer + '.weight.data')(model).detach()
+            M_last = None
+            size_uncompressed_layer = M.numel() * 4 / 1024 / 1024
+            size_other -= size_uncompressed_layer
+            block_size = int(blockconfig[args.model][layer])
+            n_word = int(wordconfig[args.model][layer])
+            logger.debug(f'{layer} - {list(M.size())} - {size_uncompressed_layer:.5f}MB - blocksize {block_size} - words {n_word}')
+        #load compressed model (not implemented for shared dictionary)
         if args.path_to_load:
             try:
                 layer_weight_path = os.path.join(args.path_to_load, f'{layer}.pth')
@@ -126,9 +163,6 @@ if __name__ == '__main__':
                 logger.info('layer weight path is not found: {}'.format(os.path.join(args.path_to_load, '{}.pth'.format(layer))))
         
         #initialization
-        error = 0.0
-        size_layer = 0.0
-        M_dpl = []
         is_conv = len(M.shape) == 4
 
         #  get weight shape info
@@ -146,16 +180,61 @@ if __name__ == '__main__':
             else:
                 out_features, in_features = M.size()
                 k = 1
+        n_blocks = 1 if block_size == 0 else in_features * k * k // block_size
         
-        n_blocks = 1 if int(blockconfig[args.model][layer]) == 0 else in_features * k * k // int(blockconfig[args.model][layer])
-        n_word = int(wordconfig[args.model][layer])
         #reshape and chunk weight matrix
-        M = reshape_weight(M)
-        logger.debug(f'\treshaped layer size {list(M.shape)}')
+        need_transpose = True 
+        if shared:
+            M_last, M = reshape_weight(M_last), reshape_weight(M)
+            assert M_last.size()[0] == M.size()[0]
+            
+            last_C_out = M_last.size()[1]
+            M = torch.cat([M_last, M], dim=1) # C_out dimension
+        else:
+            M = reshape_weight(M, need_transpose)
+        word_ceiling = min(M.size(1), block_size) if block_size != 0 else M.size(1)
+        logger.debug(f'\treshaped layer size {list(M.shape)} - #words ceiling {word_ceiling}')
         assert M.size(0) % n_blocks == 0, f"layer {layer} - division error: M[0] ({M.size(0)}) %% n_blocks ({n_blocks})"
         M_blocks = M.chunk(n_blocks, dim=0)
         begin = time.time()
-        #__________________________   DPL decomposition   ________________________
+        if args.auto_param:
+            n_weights = M.numel()
+            #__________________________   DPL decomposition   ________________________
+            def DPL_loop(): 
+                error = 0.0
+                for M_block in M_blocks:
+                    dpl = DPL.DPL(Data = M_block, DictSize=n_word, tau=0.05)
+                    dpl.Update(iterations=20, showFlag=False)
+                    block_size = torch.matmul(dpl.P_Mat, dpl.DataMat).numel() * 2/1024/1024 + dpl.DictMat.numel() * 2/1024/1024
+                    error += dpl.evaluate()
+                    return error / n_weights
+            recon_error = DPL_loop()
+            iter = 0
+            # update #words
+            if n_word > word_ceiling:
+                n_word = word_ceiling
+            while recon_error > args.error_thres_up or recon_error < args.error_thres_down:
+                if iter >= 50:
+                    break
+                if n_word > word_ceiling:
+                    n_word = word_ceiling
+                    logger.debug(f"REACH CEILING! | recon_error={recon_error:.8f} ")
+                    break
+                if recon_error < args.error_thres_down:
+                    n_word -= 1
+                    logger.debug(f"recon_error={recon_error:.8f} | tuning: n_word {n_word + 1} -> {n_word}")
+                else:
+                    n_word += 1                
+                    logger.debug(f"recon_error={recon_error:.8f} | tuning: n_word {n_word - 1} -> {n_word}")
+                if n_word <= 1:
+                    break
+                recon_error = DPL_loop()
+                iter += 1
+            wordconfig[args.model][layer] = str(n_word)
+            #_________________________________________________________________________
+        error = 0.0
+        size_layer = 0.0
+        M_dpl = []
         for M_block in M_blocks:
             dpl = DPL.DPL(Data = M_block, DictSize=n_word, tau=0.05)
             dpl.Update(iterations=20, showFlag=False)
@@ -168,22 +247,45 @@ if __name__ == '__main__':
         time_cost = end - begin
         time_compress += time_cost
         size_reconstruct += size_layer
+        
         # reconstruct
-        M = torch.cat(M_dpl, dim=0).float()
-        M = reshape_back_weight(M, k=k, conv=is_conv)
-        torch.save(M, os.path.join(args.path_to_save, '{}.pth'.format(layer)))
-        attrgetter(layer + '.weight')(model).data = M
-        if args.pretest:
+        if shared:
+            M = torch.cat(M_dpl, dim=0).float()
+            M_last, M = M[:, :last_C_out], M[:, last_C_out:]
+            M_last, M = reshape_back_weight(M_last, k=k, conv=is_conv), reshape_back_weight(M, k=k, conv=is_conv)
+            torch.save(M, os.path.join(args.path_to_save, f'{args.dataset}_{args.model}_{layer}.pth'))
+            torch.save(M_last, os.path.join(args.path_to_save, f'{args.dataset}_{args.model}_{last_layer}.pth'))
+            attrgetter(layer + '.weight')(model).data = M
+            attrgetter(last_layer + '.weight')(model).data = M_last
+        else:
+            M = torch.cat(M_dpl, dim=0).float()
+            M = reshape_back_weight(M, k=k, conv=is_conv, transpose=need_transpose)
+            torch.save(M, os.path.join(args.path_to_save, f'{args.dataset}_{args.model}_{layer}.pth'))
+            attrgetter(layer + '.weight')(model).data = M
+        
+        if args.pretest and args.dataset != 'imagenet':
             top_1, top_5 = loggerWarpper(logger, evaluate, model, test_loader)
             logger.debug('\tTop1 after compression: {:.3f}, Top5 after compression: {:.3f}'.format(top_1, top_5))
             logger.debug('\tAccuracy Loss:{:.3f}'.format(top_1_before - top_1))
         logger.debug(f'\t#words {n_word} - #blocks {n_blocks} - compressed size {size_layer:.4f}MB - ratio {size_uncompressed_layer / size_layer} - reconstruct error {error / M.numel():.6f} - time {time_cost:.2f}s')
         if error / M.numel() > thres:
             logger.warn(F' @@@@@ RESET #WORDS {n_word} - {layer} @@@@@ ') 
+        
+        last_layer = None
         #--------------------------------------------------------------------------
-    
+    # save configs to file 
+    if args.auto_param:
+        logger.debug(f"update word settings to {word_config_file}")
+        with open(word_config_file, 'w', encoding='utf-8') as word_handler:
+            wordconfig.write(word_handler)
     #result print
     logger.info(f'compressed size {size_reconstruct + size_other:.2f}MB - ratio {size_uncompressed / (size_reconstruct + size_other):.2f} - time {time_compress:.2f}s')
     logger.setLevel(logging.INFO)
     top_1, top_5 = loggerWarpper(logger, evaluate, model, test_loader)
     logger.info(f'Top1 after compression {top_1:.3f}% - Top5 after compression {top_5:.3f}%')
+    
+    csvfile = f'{args.dataset}_{args.model}_shared.csv' if args.shared else f'{args.dataset}_{args.model}.csv'
+    logger.info(f'results recorded in {csvfile}')
+    with open(os.path.join(args.results, csvfile), 'a') as csvloader:
+        writer = csv.writer(csvloader)
+        writer.writerow([args.error_thres_up, args.error_thres_down, size_uncompressed / (size_reconstruct + size_other), top_1, top_5])

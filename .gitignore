@@ -142,4 +142,5 @@ cython_debug/
 
 # customized
 model_path/
+results/
 data
